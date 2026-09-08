@@ -63,6 +63,21 @@ endef
 $(eval $(call KernelPackage,hwmon-adt7410))
 
 
+define KernelPackage/hwmon-adt7470
+  TITLE:=ADT7470 monitoring support
+  KCONFIG:=CONFIG_SENSORS_ADT7470
+  FILES:=$(LINUX_DIR)/drivers/hwmon/adt7470.ko
+  AUTOLOAD:=$(call AutoProbe,adt7470)
+  $(call AddDepends/hwmon,+kmod-i2c-core +kmod-regmap-i2c)
+endef
+
+define KernelPackage/hwmon-adt7470/description
+ Kernel module for ADT7470 thermal monitor chip
+endef
+
+$(eval $(call KernelPackage,hwmon-adt7470))
+
+
 define KernelPackage/hwmon-adt7475
   TITLE:=ADT7473/7475/7476/7490 monitoring support
   KCONFIG:=CONFIG_SENSORS_ADT7475
@@ -93,6 +108,21 @@ define KernelPackage/hwmon-coretemp/description
 endef
 
 $(eval $(call KernelPackage,hwmon-coretemp))
+
+
+define KernelPackage/hwmon-corsair-cpro
+  TITLE:=Corsair Commander Pro controller
+  KCONFIG:=CONFIG_SENSORS_CORSAIR_CPRO
+  FILES:=$(LINUX_DIR)/drivers/hwmon/corsair-cpro.ko
+  AUTOLOAD:=$(call AutoProbe,corsair-cpro)
+  $(call AddDepends/hwmon,+kmod-usb-hid)
+endef
+
+define KernelPackage/hwmon-corsair-cpro/description
+ Kernel module for the Corsair Commander Pro controller and Corsair 1000D
+endef
+
+$(eval $(call KernelPackage,hwmon-corsair-cpro))
 
 
 define KernelPackage/hwmon-dme1737
