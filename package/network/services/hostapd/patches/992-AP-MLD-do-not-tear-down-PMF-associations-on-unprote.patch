@@ -1,0 +1,56 @@
+From: cvediver <cvediver@gmail.com>
+Date: Mon, 8 Sep 2026 00:00:00 +0000
+Subject: [PATCH] AP MLD: do not tear down PMF-protected associations on unprotected auth
+
+ap_sta_re_add() unconditionally issues a driver STA remove for the
+transmitter address before re-adding the entry. On an AP MLD all links
+share one netdev, so DEL_STATION removes a kernel station by MAC address
+alone: an unprotected (spoofable) Authentication frame received on one
+link deletes the live kernel ML entry of a client that holds an
+authorized, PMF-protected association on another link, blackholing the
+client despite management frame protection.
+
+Skip the kernel remove/re-add cycle when any partner link has an
+authorized WLAN_STA_MFP station for the same MAC address, mirroring the
+same-BSS PMF guard in handle_auth(). The authentication exchange still
+proceeds; a genuine reconnection is resolved through the SA Query
+procedure, as required by IEEE 802.11 management frame protection.
+
+Signed-off-by: cvediver <cvediver@gmail.com>
+---
+
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -2172,7 +2172,32 @@
+ #ifdef CONFIG_IEEE80211BE
+ 	/* Clear stale, unauthorized MLD state before any new association. */
+ 	ap_sta_remove_link_sta(hapd, sta, check_authorized);
++
++	/* All links of an AP MLD share one netdev, so the DEL_STATION issued
++	 * below removes a kernel entry by MAC address alone. If another link
++	 * still has an authorized association protected by PMF for this MAC
++	 * address, an unprotected Authentication frame received on this link
++	 * must not be allowed to tear that association down. Mirror the
++	 * same-BSS PMF guard from handle_auth() and leave the existing entry
++	 * intact; a subsequent (re)association attempt is resolved through
++	 * the SA Query procedure. */
++	if (check_authorized && hapd->conf->mld_ap && hapd->mld) {
++		struct hostapd_data *tmp_hapd;
+ 
++		for_each_mld_link(tmp_hapd, hapd) {
++			struct sta_info *tmp_sta;
++
++			if (tmp_hapd == hapd)
++				continue;
++
++			tmp_sta = ap_get_sta(tmp_hapd, sta->addr);
++			if (tmp_sta && tmp_sta != sta &&
++			    (tmp_sta->flags & WLAN_STA_MFP) &&
++			    ap_sta_is_authorized(tmp_sta))
++				return 0;
++		}
++	}
++
+ 	if (ap_sta_is_mld(hapd, sta)) {
+ 		u8 mld_link_id = hapd->mld_link_id;
+ 
