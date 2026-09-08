@@ -3,13 +3,23 @@
 # so without this every boot invents a new base address and all BSSIDs move.
 # Pin each BSS to an address derived from the factory ART value (offset 0x04,
 # what stock uses for wlan0). Sections that already set macaddr are left alone.
+# This is a uci-defaults script: OpenWrt deletes it only when it exits 0.
+# On a fresh install the wifi-iface sections do not exist yet when this
+# runs (the radios register after firmware download, and 95-gl-wireless-
+# country's `wifi config` retries across boots for the same reason). If
+# there is nothing to pin yet, exit non-zero so we are retried next boot
+# instead of being deleted with the BSSIDs left floating forever.
 . /lib/functions.sh
 . /lib/functions/system.sh
 
 [ "$(board_name)" = "gl.inet,gl-be9300" ] || exit 0
 
 base=$(mmc_get_mac_binary 0:ART 0x4)
-[ -n "$base" ] || exit 0
+if [ -z "$base" ]; then
+	logger -t gl-be9300-wifi-macs -p daemon.warn \
+		"cannot read base MAC from ART; keeping this script for retry"
+	exit 1
+fi
 
 n=0
 set_wifi_mac() {
@@ -29,7 +39,21 @@ set_wifi_mac() {
 	n=$((n + 1))
 }
 
+seen=0
+count_ap() {
+	config_get mode "$1" mode
+	[ "$mode" = "ap" ] && seen=$((seen + 1))
+}
+
 config_load wireless
+config_foreach count_ap wifi-iface
+
+if [ "$seen" = 0 ]; then
+	logger -t gl-be9300-wifi-macs -p daemon.warn \
+		"no AP wifi-iface sections yet; keeping this script for retry"
+	exit 1
+fi
+
 config_foreach set_wifi_mac wifi-iface
 uci commit wireless
 
