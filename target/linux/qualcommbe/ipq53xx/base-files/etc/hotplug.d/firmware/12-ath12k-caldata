@@ -11,6 +11,12 @@ case "$FIRMWARE" in
 		caldata_extract "0:art" 0x1000 0x20000
 		;;
 	gl.inet,gl-be9300)
+		# ART's own length header at +0x1008 says the 2.4 GHz cal
+		# block is 0xf800 bytes (stock cnss downloads exactly that).
+		# 0x20000 over-reads into blank ART space; kept because this
+		# exact length is what was validated on hardware and ath12k
+		# ignores the tail. Do not extend further: the per-device
+		# cert/key region starts at +0x80000.
 		caldata_extract_mmc "0:ART" 0x1000 0x20000
 		;;
 	esac
