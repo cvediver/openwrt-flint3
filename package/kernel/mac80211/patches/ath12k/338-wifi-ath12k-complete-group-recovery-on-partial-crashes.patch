@@ -1,0 +1,172 @@
+From: cvediver <cvediver@gmail.com>
+Date: Sun, 7 Sep 2026 12:00:00 -0400
+Subject: [PATCH] wifi: ath12k: complete WSI group recovery on partial crashes
+
+Group recovery after a firmware crash relies on every member of the WSI
+group resetting: ath12k_core_reset() parks at the group barrier
+("waiting for N partner device(s) to reset") until ag->num_started
+reaches zero, and only then powers every member back up.  Three gaps
+remain around that barrier on mixed AHB+PCIe groups (IPQ5332 +
+2x QCN9274):
+
+1. Only two paths ever queue reset work: a PCIe device's own MHI RDDM
+   callback (self only) and the AHB rootPD SSR notifier (group-wide).
+   A lone PCIe RDDM therefore tears down the whole group's mac state
+   (ath12k_core_pre/post_reconfigure_recovery iterate every hw of the
+   group) but resets only itself; the AHB member and a non-asserted
+   PCIe partner stay attached and the barrier parks forever - all three
+   radios down until reboot.  Queue reset work for every other
+   registered, not-already-resetting group member when parking at the
+   barrier, mirroring ath12k_ahb_queue_group_recovery() for every crash
+   origin.
+
+2. The group power-up loop discards the ath12k_hif_power_up() return
+   value.  A userPD spawn/ready timeout right after a rootPD reload
+   leaves that member down with no retry; since
+   ath12k_core_hw_group_start_ready() then never becomes true, no hw of
+   the group is ever restarted and mac80211 stays in_reconfig with
+   queues stopped.  Retry the power-up once (with an intervening
+   power-down) and log loudly if the member still fails.
+
+3. ath12k_ahb_queue_group_recovery() sets ATH12K_FLAG_CRASH_FLUSH and
+   ATH12K_FLAG_RECOVERY on every member before deciding whether to
+   queue its reset.  A member skipped because it is already past its
+   own reset (is_reset still set, restart in flight) may have already
+   passed the only recovery-path clear site of CRASH_FLUSH in
+   ath12k_core_qmi_firmware_ready(); the stale flag then permanently
+   fails its WMI/CE paths with -ESHUTDOWN.  Set the flags only on
+   members which are actually queued; a member already resetting
+   manages its own flags.
+
+A member mid-restart at fan-out time is still skipped and not reset
+again (queueing it would self-cancel via the reset_count > 1 skip path
+once its restart completes); back-to-back crashes within that window
+remain unrecovered.
+
+Signed-off-by: cvediver <cvediver@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/ahb.c  | 14 ++++--
+ drivers/net/wireless/ath/ath12k/core.c | 64 +++++++++++++++++++++++++-
+ 2 files changed, 73 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -957,14 +957,20 @@
+ 		    !test_bit(ATH12K_FLAG_REGISTERED, &partner_ab->dev_flags) ||
+ 		    test_bit(ATH12K_FLAG_UNREGISTERING, &partner_ab->dev_flags))
+ 			continue;
+-
+-		set_bit(ATH12K_FLAG_CRASH_FLUSH, &partner_ab->dev_flags);
+-		set_bit(ATH12K_FLAG_RECOVERY, &partner_ab->dev_flags);
+ 
++		/* A member that is already resetting manages its own flags.
++		 * Setting ATH12K_FLAG_CRASH_FLUSH on a member that already
++		 * passed its flag-clearing point in
++		 * ath12k_core_qmi_firmware_ready() would never be cleared
++		 * again and permanently kills its WMI/CE paths.
++		 */
+ 		if (READ_ONCE(partner_ab->is_reset) ||
+ 		    work_busy(&partner_ab->reset_work))
+ 			continue;
+ 
++		set_bit(ATH12K_FLAG_CRASH_FLUSH, &partner_ab->dev_flags);
++		set_bit(ATH12K_FLAG_RECOVERY, &partner_ab->dev_flags);
++
+ 		queue_work(partner_ab->workqueue_aux, &partner_ab->reset_work);
+ 	}
+ 	mutex_unlock(&ag->mutex);
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1729,13 +1729,54 @@
+ 
+ exit_restart:
+ 	complete(&ab->restart_completed);
++}
++
++/* Queue reset work for every other registered member of the WSI group.
++ *
++ * The group barrier in ath12k_core_reset() only releases once every
++ * member has powered down, but a member whose firmware did not crash on
++ * its own has no crash notification of its own: a lone PCIe RDDM leaves
++ * the AHB device (and a non-asserted PCIe partner) attached to the group
++ * and the barrier parked forever.  Mirror the rootPD fan-out from
++ * ath12k_ahb_queue_group_recovery() for every crash origin.
++ *
++ * Flags are only set on members which are actually queued here.  A
++ * member that is already resetting (or mid-restart, is_reset still set)
++ * manages its own flags; setting ATH12K_FLAG_CRASH_FLUSH on a member
++ * past its flag-clearing point in ath12k_core_qmi_firmware_ready()
++ * would never be cleared again and permanently kills its WMI/CE paths.
++ */
++static void ath12k_core_queue_partner_reset(struct ath12k_base *ab)
++{
++	struct ath12k_hw_group *ag = ab->ag;
++	struct ath12k_base *partner_ab;
++	int i;
++
++	lockdep_assert_held(&ag->mutex);
++
++	for (i = 0; i < ag->num_devices; i++) {
++		partner_ab = ag->ab[i];
++		if (!partner_ab || partner_ab == ab ||
++		    !test_bit(ATH12K_FLAG_REGISTERED, &partner_ab->dev_flags) ||
++		    test_bit(ATH12K_FLAG_UNREGISTERING, &partner_ab->dev_flags))
++			continue;
++
++		if (READ_ONCE(partner_ab->is_reset) ||
++		    work_busy(&partner_ab->reset_work))
++			continue;
++
++		set_bit(ATH12K_FLAG_CRASH_FLUSH, &partner_ab->dev_flags);
++		set_bit(ATH12K_FLAG_RECOVERY, &partner_ab->dev_flags);
++
++		queue_work(partner_ab->workqueue_aux, &partner_ab->reset_work);
++	}
+ }
+ 
+ static void ath12k_core_reset(struct work_struct *work)
+ {
+ 	struct ath12k_base *ab = container_of(work, struct ath12k_base, reset_work);
+ 	struct ath12k_hw_group *ag = ab->ag;
+-	int reset_count, fail_cont_count, i;
++	int reset_count, fail_cont_count, i, ret;
+ 	long time_left;
+ 
+ 	if (!(test_bit(ATH12K_FLAG_QMI_FW_READY_COMPLETE, &ab->dev_flags))) {
+@@ -1804,6 +1845,7 @@
+ 	ath12k_core_to_group_ref_put(ab);
+ 
+ 	if (ag->num_started > 0) {
++		ath12k_core_queue_partner_reset(ab);
+ 		ath12k_dbg(ab, ATH12K_DBG_BOOT,
+ 			   "waiting for %d partner device(s) to reset\n",
+ 			   ag->num_started);
+@@ -1819,7 +1861,27 @@
+ 		if (!ab)
+ 			continue;
+ 
+-		ath12k_hif_power_up(ab);
++		ret = ath12k_hif_power_up(ab);
++		if (ret) {
++			/* One bounded retry: a userPD spawn or ready timeout
++			 * right after a rootPD reload can be transient, and a
++			 * member that stays down keeps
++			 * ath12k_core_hw_group_start_ready() false so no hw of
++			 * the group is ever restarted.
++			 */
++			ath12k_warn(ab,
++				    "failed to power up device during reset (%d), retrying\n",
++				    ret);
++			ath12k_hif_power_down(ab, false);
++			ret = ath12k_hif_power_up(ab);
++		}
++		if (ret) {
++			ath12k_err(ab,
++				   "failed to power up device during reset: %d; wireless stays down until the next crash or a reboot\n",
++				   ret);
++			continue;
++		}
++
+ 		ath12k_dbg(ab, ATH12K_DBG_BOOT, "reset started\n");
+ 	}
+ 
