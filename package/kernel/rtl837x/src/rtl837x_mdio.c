@@ -1058,15 +1058,31 @@ static int rtl837x_dsa_probe(struct mdio_device *mdiodev)
 
 	dev_set_drvdata(dev, gsw);
 
-	ret = rtl8372n_hw_init(gsw, gsw->swap_cfg);
-	if (ret)
-	{
-		dev_err(gsw->dev, "rtl8372n_hw_init failed, ret=%d\n",ret);
-		rtl837x_clear_global_priv(gsw);
-		dev_set_drvdata(dev, NULL);
-		if (master)
-			dev_put(master);
-		return -ENODEV;
+	/* The initialization sequence issues hundreds of MDIO register
+	 * accesses and any single failure aborts it.  A transient MDIO
+	 * error at boot would otherwise leave the switch dead until the
+	 * next reboot, so retry the whole sequence a bounded number of
+	 * times.  Each attempt starts with rtl837x_hw_reset(), which wipes
+	 * any partial programming left by a failed attempt.
+	 */
+	for (int attempt = 1;; attempt++) {
+		ret = rtl8372n_hw_init(gsw, gsw->swap_cfg);
+		if (!ret)
+			break;
+
+		if (attempt >= 3) {
+			dev_err(gsw->dev, "rtl8372n_hw_init failed, ret=%d\n", ret);
+			rtl837x_clear_global_priv(gsw);
+			dev_set_drvdata(dev, NULL);
+			if (master)
+				dev_put(master);
+			return -ENODEV;
+		}
+
+		dev_warn(gsw->dev,
+			 "rtl8372n_hw_init attempt %d failed (%d), retrying\n",
+			 attempt, ret);
+		msleep(50);
 	}
 
 	dev_info(gsw->dev, "rtl837x DSA cpu-port:%u valid-port-mask:0x%x\n",
