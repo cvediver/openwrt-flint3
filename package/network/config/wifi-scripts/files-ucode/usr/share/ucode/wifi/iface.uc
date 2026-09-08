@@ -5,13 +5,13 @@ import * as fs from 'fs';
 
 export function parse_encryption(config, dev_config, phy_features) {
 	if (!config.encryption)
-		config.encryption = 'none';
+		return;
 
 	let encryption = split(config.encryption, '+', 2);
 
 	config.wpa = 0;
 	for (let k, v in { 'wpa2*': 2, 'wpa3*': 2, '*psk2*': 2, 'psk3*': 2, 'sae*': 2,
-			'owe*': 2, 'wpa*mixed*': 3, '*psk*mixed*': 3, 'wpa*': 1, '*psk*': 1, })
+			'owe*': 2, 'dpp': 2, 'wpa*mixed*': 3, '*psk*mixed*': 3, 'wpa*': 1, '*psk*': 1, })
 		if (wildcard(config.encryption, k)) {
 			config.wpa = v;
 			break;
@@ -35,6 +35,10 @@ export function parse_encryption(config, dev_config, phy_features) {
 	switch(config.auth_type) {
 	case 'owe':
 		config.auth_type = 'owe';
+		break;
+
+	case 'dpp':
+		config.auth_type = 'dpp';
 		break;
 
 	case 'wpa3-192':
@@ -114,7 +118,7 @@ export function parse_encryption(config, dev_config, phy_features) {
 
 	if (!config.wpa)
 		config.wpa_pairwise ??= null;
-	else if (dev_config.band == '60g')
+	else if (config.hw_mode == 'ad')
 		config.wpa_pairwise ??= 'GCMP';
 	else if (config.gcmp256 && phy_features?.cipher_gcmp256)
 		config.wpa_pairwise ??= 'GCMP-256 CCMP';
@@ -225,7 +229,14 @@ export function wpa_key_mgmt(config, band) {
 	case 'owe':
 		append_value(config, 'wpa_key_mgmt', 'OWE');
 		break;
+
+	case 'dpp':
+		append_value(config, 'wpa_key_mgmt', 'DPP');
+		break;
 	}
+
+	if (config.dpp && config.auth_type != 'dpp')
+		append_value(config, 'wpa_key_mgmt', 'DPP');
 
 	if (config.fils) {
 		switch(config.auth_type) {
