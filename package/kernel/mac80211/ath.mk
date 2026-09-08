@@ -71,7 +71,14 @@ config-$(call config_package,ath11k-pci) += ATH11K_PCI
 config-$(call config_package,ath12k) += ATH12K
 ifdef CONFIG_PACKAGE_kmod-ath12k
   config-y += ATH12K_AHB
-  config-$(CONFIG_TARGET_qualcommbe) += ATH12K_COREDUMP
+  # ATH12K_COREDUMP is deliberately NOT enabled for qualcommbe: on
+  # IPQ5332 the RDDM coredump upload reads the crashed PCIe device's
+  # registers while the group recovery power-cycles it, and an MMIO
+  # read to the resetting endpoint raises an Asynchronous SError
+  # (fatal machine check, whole-system panic) instead of returning
+  # ~0 as on PC-class hosts. Verified on a GL-BE9300: simulate_fw_crash
+  # on the QCN9274 panicked in ath12k_pci_read32 <- _copy_to_iter
+  # during "Uploading coredump" (ramoops capture, 2026-09-08).
 endif
 
 config-$(call config_package,ath5k) += ATH5K ATH5K_PCI
