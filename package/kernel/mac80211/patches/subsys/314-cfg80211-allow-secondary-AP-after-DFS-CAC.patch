@@ -6,12 +6,20 @@ When multiple AP interfaces share a DFS channel, only the first interface
 performs CAC. Allow subsequent interfaces to use the completed CAC while an
 AP is already beaconing across every requested DFS subchannel.
 
+Do not let this cancel a non-occupancy period: cfg80211_set_dfs_state()
+overwrites the per-channel state unconditionally, so a START_AP arriving
+while a radar-struck AP is still beaconing through its channel-switch
+countdown would flip NL80211_DFS_UNAVAILABLE back to AVAILABLE and admit
+a new AP inside the NOP. Refuse the concurrent-CAC shortcut whenever any
+requested subchannel is in the UNAVAILABLE state.
+
 Signed-off-by: Akshay Kakatkar <me@kakatkarakshay.dev>
+Signed-off-by: cvediver <cvediver@gmail.com>
 ---
 
 --- a/net/wireless/chan.c
 +++ b/net/wireless/chan.c
-@@ -990,11 +990,12 @@ static bool cfg80211_dfs_permissive_chan
+@@ -990,11 +990,12 @@
  	return false;
  }
  
@@ -26,7 +34,7 @@ Signed-off-by: Akshay Kakatkar <me@kakatkarakshay.dev>
  
  	lockdep_assert_held(&rdev->wiphy.mtx);
  
-@@ -1005,6 +1006,19 @@ static bool cfg80211_dfs_sta_present(str
+@@ -1005,6 +1006,19 @@
  		if (cfg80211_dfs_permissive_check_wdev(rdev, NL80211_IFTYPE_AP,
  						       wdev, chan))
  			return true;
@@ -46,7 +54,19 @@ Signed-off-by: Akshay Kakatkar <me@kakatkarakshay.dev>
  	}
  
  	return false;
-@@ -1021,7 +1035,7 @@ void cfg80211_set_dfs_concurrent(struct
+@@ -1018,10 +1032,19 @@
+ 	for_each_subchan(chandef, freq, cf) {
+ 		c = ieee80211_get_channel_khz(wiphy, freq);
+ 		if (!c)
++			return;
++
++		/* Never cancel a non-occupancy period: after a radar hit the
++		 * channel is NL80211_DFS_UNAVAILABLE while an existing AP may
++		 * still be beaconing during its channel-switch countdown, and
++		 * an interface that is vacating the channel must not validate
++		 * it for a new AP. */
++		if ((c->flags & IEEE80211_CHAN_RADAR) &&
++		    c->dfs_state == NL80211_DFS_UNAVAILABLE)
  			return;
  
  		if ((c->flags & IEEE80211_CHAN_RADAR) &&
