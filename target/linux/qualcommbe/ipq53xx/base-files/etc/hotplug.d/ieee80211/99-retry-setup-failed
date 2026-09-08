@@ -1,13 +1,16 @@
 #!/bin/sh
-# The AHB (2.4 GHz) component of the IPQ53xx multi-radio wiphy can finish
-# probing after netifd's first wireless setup pass, which leaves its radio
-# in retry_setup_failed ("wifi-scripts: Bug: PHY is undefined for device").
-# When a phy appears, re-kick wireless setup if any radio is stuck.
+# Recovery net for radios stuck in retry_setup_failed. Two producers:
+# - boot: the AHB (2.4 GHz) radio can finish probing after netifd's first
+#   wireless setup pass (covered in-band by wifi-scripts' late-PHY retry);
+# - firmware SSR: after a Q6/WCSS crash the phys re-register, but a wdev
+#   netifd still considers up is not retried by the in-band path.
+# `wifi up` below is a no-op unless some radio actually reports
+# retry_setup_failed, so this cannot disturb a healthy system.
 [ "$ACTION" = "add" ] || exit 0
 (
 	sleep 10
 	ubus call network.wireless status 2>/dev/null | \
 		grep -q '"retry_setup_failed": true' || exit 0
-	logger -t wifi-retry "phy added late; retrying failed radio setup"
+	logger -t wifi-retry "phy added with a radio in retry_setup_failed; retrying wireless setup"
 	wifi up
 ) &
