@@ -1,0 +1,63 @@
+From: cvediver <cvediver@gmail.com>
+Subject: [PATCH] wifi: ath12k: reset the PCIe link on recovery power-up
+
+Three ramoops-captured panics on a GL.iNet GL-BE9300 (IPQ5332 +
+QCN9274) show that after an RDDM firmware crash any BAR access to the
+endpoint can raise an Asynchronous SError on the SoC NoC - the
+endpoint answers config space (so pci_device_is_present() passes) but
+stalls memory space while it self-resets out of RDDM. The vendor
+driver survives the same crash by performing a controlled link reset
+(PERST toggle) and gating every register access on link-down flags;
+mainline-style hosts just read ~0.
+
+Do the equivalent with generic PCI core machinery: on every power-up
+after the first, run pci_reset_bus() on the endpoint - a secondary
+bus reset with config state saved and restored around it - so MHI
+restart always starts from a freshly retrained link and a clean
+device, never a half-dead one. First boot skips the reset (the device
+just enumerated). If the reset fails, bail out cleanly and let the
+group-recovery retry handle it instead of panicking the system.
+
+--- a/drivers/net/wireless/ath/ath12k/pci.h
++++ b/drivers/net/wireless/ath/ath12k/pci.h
+@@ -122,6 +122,7 @@ struct ath12k_pci {
+ 	unsigned long mhi_state;
+ 	enum mhi_callback mhi_pre_cb;
+ 	u32 register_window;
++	bool powered_up_once;
+ 
+ 	/* protects register_window above */
+ 	spinlock_t window_lock;
+--- a/drivers/net/wireless/ath/ath12k/pci.c
++++ b/drivers/net/wireless/ath/ath12k/pci.c
+@@ -1434,6 +1434,30 @@ int ath12k_pci_power_up(struct ath12k_ba
+ 	struct ath12k_pci *ab_pci = ath12k_pci_priv(ab);
+ 	int ret;
+ 
++	/* Recovery from an RDDM firmware crash: the endpoint self-resets
++	 * and stalls memory-space transactions while its link retrains.
++	 * On the IPQ5332 NoC a BAR access in that window raises a fatal
++	 * Asynchronous SError instead of returning ~0, so a radio crash
++	 * panics the whole system. Reset the link with config state
++	 * saved/restored (pci_reset_bus) before touching any register,
++	 * mirroring the vendor driver's PERST-based recovery.
++	 */
++	if (ab_pci->powered_up_once) {
++		ret = pci_reset_bus(ab_pci->pdev);
++		if (ret) {
++			ath12k_err(ab, "PCIe link reset failed: %d\n", ret);
++			return ret;
++		}
++
++		if (!pci_device_is_present(ab_pci->pdev)) {
++			ath12k_err(ab, "PCIe device absent after link reset\n");
++			return -ENODEV;
++		}
++
++		pci_set_master(ab_pci->pdev);
++	}
++	ab_pci->powered_up_once = true;
++
+ 	ab_pci->register_window = 0;
+ 	clear_bit(ATH12K_PCI_FLAG_INIT_DONE, &ab_pci->flags);
+ 	ath12k_pci_sw_reset(ab_pci->ab, true);
