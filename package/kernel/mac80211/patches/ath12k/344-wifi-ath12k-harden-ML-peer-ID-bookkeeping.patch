@@ -1,0 +1,97 @@
+From: cvediver <cvediver@gmail.com>
+Date: Fri, 12 Sep 2026 10:30:00 -0400
+Subject: [PATCH] wifi: ath12k: harden ML peer ID bookkeeping
+
+Two hardening fixes for the host-side ML peer ID allocator, found
+while root-causing the first-association downlink failure on the
+GL-BE9300 (dead first TX burst; firmware TQM lost wakeup at
+wal_tqm.c:866 / wal_tx_de_mgmt.c:879).
+
+First, both remaining ML peer ID release sites clear the bitmap bit
+unmasked and unbounded:
+
+	if (!test_bit(ahsta->ml_peer_id, ah->quarantined_ml_peer_id_map))
+		clear_bit(ahsta->ml_peer_id, ah->free_ml_peer_id_map);
+
+in ath12k_mac_ml_station_remove() and at the ml_peer_id_clear error
+label of ath12k_mac_op_sta_state(). This is the same defect class the
+SSR path fix in ath12k_mac_dp_peer_cleanup() already addressed: a
+value of ATH12K_MLO_PEER_ID_INVALID (0xFFFF, e.g. a double release) or
+a composite id carrying ATH12K_PEER_ML_ID_VALID indexes kilobytes past
+the ATH12K_MAX_MLO_PEERS-bit maps, corrupting the adjacent
+ath12k_hw::dp_hw state (dp_peers[] RCU pointers) while leaking the
+intended bit. Mask the id back to the host domain and bounds-check it
+with a WARN_ON_ONCE before touching either bitmap, mirroring the SSR
+fix.
+
+Second, nothing clamps the usable ML peer ID count to the hardware
+limit. ah->max_ml_peer_ids is seeded with the 1024-bit host bitmap
+capacity and only reduced by the MLO setup complete v2 event. The
+host, however, promises firmware hw_params->max_mlo_peer peers (256 on
+these platforms) in both the QMI host capability request and the WMI
+MLO setup path. If the v2 event is absent or lost, the round-robin
+allocator will eventually hand firmware IDs beyond the promised range
+- silently, with cross-chip peer mapping consequences entirely inside
+firmware. Clamp the allocation bound to the smallest
+hw_params->max_mlo_peer of the radios in the group at hw allocation
+time; the setup complete event value can then only shrink it further.
+
+Signed-off-by: cvediver <cvediver@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 23 +++++++++++++++++++----
+ 1 file changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index f791c2a..0865c61 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -7401,11 +7401,14 @@ static void ath12k_mac_ml_station_remove(struct ath12k_vif *ahvif,
+ 		ath12k_peer_ml_quarantine(ah, ahsta, ret);
+ 
+ 	if (sta->mlo) {
++		u16 ml_peer_id = ahsta->ml_peer_id & ~ATH12K_PEER_ML_ID_VALID;
++
+ 		ath12k_info(ath12k_ah_to_ar(ah, 0)->ab,
+ 			    "ml peer id %u freed for %pM\n",
+ 			    ahsta->ml_peer_id, sta->addr);
+-		if (!test_bit(ahsta->ml_peer_id, ah->quarantined_ml_peer_id_map))
+-			clear_bit(ahsta->ml_peer_id, ah->free_ml_peer_id_map);
++		if (!WARN_ON_ONCE(ml_peer_id >= ATH12K_MAX_MLO_PEERS) &&
++		    !test_bit(ml_peer_id, ah->quarantined_ml_peer_id_map))
++			clear_bit(ml_peer_id, ah->free_ml_peer_id_map);
+ 		ahsta->ml_peer_id = ATH12K_MLO_PEER_ID_INVALID;
+ 	}
+ }
+@@ -8127,11 +8130,14 @@ peer_delete:
+ 	ath12k_dp_peer_delete(&ah->dp_hw, sta->addr, sta);
+ ml_peer_id_clear:
+ 	if (sta->mlo) {
++		u16 ml_peer_id = ahsta->ml_peer_id & ~ATH12K_PEER_ML_ID_VALID;
++
+ 		ath12k_info(ath12k_ah_to_ar(ah, 0)->ab,
+ 			    "ml peer id %u freed for %pM\n",
+ 			    ahsta->ml_peer_id, sta->addr);
+-		if (!test_bit(ahsta->ml_peer_id, ah->quarantined_ml_peer_id_map))
+-			clear_bit(ahsta->ml_peer_id, ah->free_ml_peer_id_map);
++		if (!WARN_ON_ONCE(ml_peer_id >= ATH12K_MAX_MLO_PEERS) &&
++		    !test_bit(ml_peer_id, ah->quarantined_ml_peer_id_map))
++			clear_bit(ml_peer_id, ah->free_ml_peer_id_map);
+ 		ahsta->ml_peer_id = ATH12K_MLO_PEER_ID_INVALID;
+ 	}
+ exit:
+@@ -15710,6 +15716,15 @@ static struct ath12k_hw *ath12k_mac_hw_allocate(struct ath12k_hw_group *ag,
+ 	ah->num_radio = num_pdev_map;
+ 	ah->max_ml_peer_ids = ATH12K_MAX_MLO_PEERS;
+ 
++	/* Never allocate ML peer IDs beyond what the weakest radio promised
++	 * to firmware (QMI host cap and WMI MLO setup both use
++	 * hw_params->max_mlo_peer); the MLO setup complete event value can
++	 * only shrink this further.
++	 */
++	for (i = 0; i < num_pdev_map; i++)
++		ah->max_ml_peer_ids = min(ah->max_ml_peer_ids,
++					  pdev_map[i].ab->hw_params->max_mlo_peer);
++
+ 	mutex_init(&ah->hw_mutex);
+ 
+ 	spin_lock_init(&ah->survey_lock);
