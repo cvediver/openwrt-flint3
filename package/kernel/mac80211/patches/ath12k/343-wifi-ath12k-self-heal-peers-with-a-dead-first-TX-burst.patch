@@ -1,0 +1,310 @@
+From: cvediver <cvediver@gmail.com>
+Date: Fri, 12 Sep 2026 10:00:00 -0400
+Subject: [PATCH] wifi: ath12k: self-heal peers with a dead first TX burst
+
+On the GL-BE9300 (IPQ5332 + 2x QCN9274, WLAN.WBE.1.6 firmware) a
+station's FIRST association can come up with every downlink unicast
+data frame silently lost: nothing goes out over the air, the client
+never ACKs, and management/EAPOL keep working. Reassociation always
+recovers, permanently. Bench reproduction shows the failure appears
+only past ~3.85 days of AP uptime and only for cold first-time peer
+bring-up.
+
+Reverse engineering of the firmware images located the mechanism.
+Firmware gates every peer's data TIDs at creation (TQM TID flags bit31,
+"tqm tickle pending due to assoc_flag=0 peer %d", wal_tqm.c:866) and
+opens them during peer_assoc through an asynchronous chain ending in
+the TQM SSN-sync status callback (wal_tx_de_mgmt.c:879). That callback
+returns WITHOUT tickling or clearing the pending bit if the TID is
+still connection-pause module-blocked when the SSN-sync status arrives.
+Nothing ever replays the tickle - re-tickle is itself gated by the
+assoc flag - so the TID's downlink queue is parked in TQM forever: a
+classic lost wakeup. Only a full first-time bring-up runs this chain
+with the assoc-time block modules (security 0x14, BA 0x0c, MLO
+0x64/0x57) still engaged; a reassociation over a warm peer skips the
+SSN-sync window entirely, which is why reconnecting always fixes it.
+
+The firmware is signature-enforced, so the fix has to live host-side,
+and the wedged state is invisible to the host except through its
+observable: TX attempts with zero completions right after
+authorization.
+
+Detect and heal exactly that. When an AP-mode station (including AP
+MLD) transitions to AUTHORIZED, arm a one-shot wiphy delayed work 1.5 s
+out and count, per station, unicast data enqueues and TQM frame-acked
+completions. If the window shows >= 4 attempts and zero ACKs, log one
+loud line and discard the parked frames with the existing per-station
+WMI TID flush (ath12k_mac_op_flush_sta), which reaches TQM through the
+flush command path and gives the client's retransmissions a fresh
+enqueue; then re-check once more 1.5 s later and report whether the
+flush recovered the peer. A healthy first burst disarms silently. The
+check is cancelled when the station leaves AUTHORIZED or is removed,
+and the counters cost nothing while the check is not armed. For MLO
+stations all data rides the primary link and the flush helper already
+iterates every link, so no extra MLO handling is needed. A station
+with buffered-only traffic (e.g. immediately dozing) can trip a
+spurious flush; the cost is one warning and a few dropped frames that
+upper layers retransmit.
+
+Also add two ath12k_info diagnostics on the ML peer ID round-robin
+allocator (allocation with the cursor value, and both free sites).
+The leading host-side candidate for the ~3.85 d onset is ML peer ID
+recycling: the cursor never reuses an ID until max_ml_peer_ids
+allocations have passed, which at the 256-ID default equals 255
+association cycles, and a recycled ID re-enters firmware ML peer
+state warm. One line per association makes the ID history visible on
+the bench without debugfs.
+
+Signed-off-by: cvediver <cvediver@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h        | 11 ++++
+ drivers/net/wireless/ath/ath12k/mac.c         | 93 ++++++++++++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/peer.c        |  6 +-
+ drivers/net/wireless/ath/ath12k/peer.h        |  2 +-
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c |  8 +++
+ drivers/net/wireless/ath/ath12k/wifi7/hw.c    |  7 +++
+ 6 files changed, 124 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index 1a68ddf..3421f1b 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -539,6 +539,17 @@ struct ath12k_sta {
+ 	enum ieee80211_sta_state state;
+ 
+ 	bool enable_4addr;
++
++	/* First-TX-burst self-heal (firmware first-assoc lost-wakeup
++	 * workaround). The counters are only maintained while
++	 * txburst_check_armed is set, i.e. for a short window after an
++	 * AP-mode station reaches AUTHORIZED.
++	 */
++	struct wiphy_delayed_work txburst_check_wk;
++	atomic_t txburst_attempts;
++	atomic_t txburst_acked;
++	bool txburst_check_armed;
++	bool txburst_flushed;
+ };
+ 
+ #define ATH12K_HALF_20MHZ_BW	10
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index f06f030..f791c2a 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -7401,6 +7401,9 @@ static void ath12k_mac_ml_station_remove(struct ath12k_vif *ahvif,
+ 		ath12k_peer_ml_quarantine(ah, ahsta, ret);
+ 
+ 	if (sta->mlo) {
++		ath12k_info(ath12k_ah_to_ar(ah, 0)->ab,
++			    "ml peer id %u freed for %pM\n",
++			    ahsta->ml_peer_id, sta->addr);
+ 		if (!test_bit(ahsta->ml_peer_id, ah->quarantined_ml_peer_id_map))
+ 			clear_bit(ahsta->ml_peer_id, ah->free_ml_peer_id_map);
+ 		ahsta->ml_peer_id = ATH12K_MLO_PEER_ID_INVALID;
+@@ -7851,6 +7854,63 @@ static int ath12k_mac_select_links(struct ath12k_base *ab,
+ 	return 0;
+ }
+ 
++/* Self-heal for AP-mode stations whose first TX burst after authorization
++ * dies silently in firmware: the TQM TID assoc gate can eat the SSN-sync
++ * tickle when the TID is still module-blocked, leaving every downlink data
++ * frame queued in TQM forever (see the patch log). A WMI per-peer TID flush
++ * kicks the queues back to life; re-check once afterwards.
++ */
++#define ATH12K_TXBURST_CHECK_DELAY_MS	1500
++#define ATH12K_TXBURST_MIN_ATTEMPTS	4
++
++static void ath12k_mac_sta_txburst_check_wk(struct wiphy *wiphy,
++					    struct wiphy_work *work)
++{
++	struct ath12k_sta *ahsta = container_of(work, struct ath12k_sta,
++						txburst_check_wk.work);
++	struct ieee80211_sta *sta = ath12k_ahsta_to_sta(ahsta);
++	struct ath12k_vif *ahvif = ahsta->ahvif;
++	struct ath12k_hw *ah;
++	u32 attempts, acked;
++
++	lockdep_assert_wiphy(wiphy);
++
++	if (!ahvif)
++		return;
++
++	ah = ahvif->ah;
++
++	if (!ahsta->txburst_check_armed ||
++	    ahsta->state != IEEE80211_STA_AUTHORIZED)
++		return;
++
++	attempts = atomic_read(&ahsta->txburst_attempts);
++	acked = atomic_read(&ahsta->txburst_acked);
++
++	if (acked || attempts < ATH12K_TXBURST_MIN_ATTEMPTS) {
++		/* Healthy, or not enough traffic to judge: stand down. */
++		WRITE_ONCE(ahsta->txburst_check_armed, false);
++		return;
++	}
++
++	if (!ahsta->txburst_flushed) {
++		ath12k_hw_warn(ah,
++			       "peer %pM: first TX burst dead (a=%u ok=%u), flushing TIDs (first-assoc lost-wakeup workaround)\n",
++			       sta->addr, attempts, acked);
++		ath12k_mac_op_flush_sta(ah->hw, ath12k_ahvif_to_vif(ahvif), sta);
++		ahsta->txburst_flushed = true;
++		atomic_set(&ahsta->txburst_attempts, 0);
++		atomic_set(&ahsta->txburst_acked, 0);
++		wiphy_delayed_work_queue(wiphy, &ahsta->txburst_check_wk,
++					 msecs_to_jiffies(ATH12K_TXBURST_CHECK_DELAY_MS));
++		return;
++	}
++
++	ath12k_hw_warn(ah, "flush did not recover peer %pM (a=%u ok=%u)\n",
++		       sta->addr, attempts, acked);
++	WRITE_ONCE(ahsta->txburst_check_armed, false);
++}
++
+ int ath12k_mac_op_sta_state(struct ieee80211_hw *hw,
+ 			    struct ieee80211_vif *vif,
+ 			    struct ieee80211_sta *sta,
+@@ -7886,13 +7946,15 @@ int ath12k_mac_op_sta_state(struct ieee80211_hw *hw,
+ 	    new_state == IEEE80211_STA_NONE) {
+ 		memset(ahsta, 0, sizeof(*ahsta));
+ 		ahsta->free_logical_link_idx_map = U16_MAX;
++		wiphy_delayed_work_init(&ahsta->txburst_check_wk,
++					ath12k_mac_sta_txburst_check_wk);
+ 
+ 		arsta = &ahsta->deflink;
+ 
+ 		/* ML sta */
+ 		if (sta->mlo && !ahsta->links_map &&
+ 		    (hweight16(sta->valid_links) == 1)) {
+-			ahsta->ml_peer_id = ath12k_peer_ml_alloc(ah);
++			ahsta->ml_peer_id = ath12k_peer_ml_alloc(ah, sta->addr);
+ 			if (ahsta->ml_peer_id == ATH12K_MLO_PEER_ID_INVALID) {
+ 				ath12k_hw_warn(ah, "unable to allocate ML peer id for sta %pM",
+ 					       sta->addr);
+@@ -7974,6 +8036,17 @@ int ath12k_mac_op_sta_state(struct ieee80211_hw *hw,
+ 		ieee80211_set_active_links(vif, selected_links);
+ 	}
+ 
++	/* Station is going away or dropping out of AUTHORIZED: disarm the
++	 * first-TX-burst check so it cannot run against a dead station.
++	 */
++	if ((old_state == IEEE80211_STA_AUTHORIZED &&
++	     new_state == IEEE80211_STA_ASSOC) ||
++	    (old_state == IEEE80211_STA_NONE &&
++	     new_state == IEEE80211_STA_NOTEXIST)) {
++		WRITE_ONCE(ahsta->txburst_check_armed, false);
++		wiphy_delayed_work_cancel(hw->wiphy, &ahsta->txburst_check_wk);
++	}
++
+ 	/* Handle all the other state transitions in generic way */
+ 	valid_links = ahsta->links_map;
+ 	for_each_set_bit(link_id, &valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
+@@ -8001,6 +8074,21 @@ int ath12k_mac_op_sta_state(struct ieee80211_hw *hw,
+ 		}
+ 	}
+ 
++	/* AP mode (including AP MLD): downlink data starts flowing once the
++	 * station is authorized. Arm a one-shot check for the dead first TX
++	 * burst signature.
++	 */
++	if (vif->type == NL80211_IFTYPE_AP &&
++	    old_state == IEEE80211_STA_ASSOC &&
++	    new_state == IEEE80211_STA_AUTHORIZED) {
++		atomic_set(&ahsta->txburst_attempts, 0);
++		atomic_set(&ahsta->txburst_acked, 0);
++		ahsta->txburst_flushed = false;
++		WRITE_ONCE(ahsta->txburst_check_armed, true);
++		wiphy_delayed_work_queue(hw->wiphy, &ahsta->txburst_check_wk,
++					 msecs_to_jiffies(ATH12K_TXBURST_CHECK_DELAY_MS));
++	}
++
+ 	if (ieee80211_vif_is_mld(vif) && vif->type == NL80211_IFTYPE_STATION &&
+ 	    old_state == IEEE80211_STA_ASSOC && new_state == IEEE80211_STA_AUTHORIZED) {
+ 		for_each_ar(ah, ar, i) {
+@@ -8039,6 +8127,9 @@ peer_delete:
+ 	ath12k_dp_peer_delete(&ah->dp_hw, sta->addr, sta);
+ ml_peer_id_clear:
+ 	if (sta->mlo) {
++		ath12k_info(ath12k_ah_to_ar(ah, 0)->ab,
++			    "ml peer id %u freed for %pM\n",
++			    ahsta->ml_peer_id, sta->addr);
+ 		if (!test_bit(ahsta->ml_peer_id, ah->quarantined_ml_peer_id_map))
+ 			clear_bit(ahsta->ml_peer_id, ah->free_ml_peer_id_map);
+ 		ahsta->ml_peer_id = ATH12K_MLO_PEER_ID_INVALID;
+diff --git a/drivers/net/wireless/ath/ath12k/peer.c b/drivers/net/wireless/ath/ath12k/peer.c
+index 2e69437..dc40224 100644
+--- a/drivers/net/wireless/ath/ath12k/peer.c
++++ b/drivers/net/wireless/ath/ath12k/peer.c
+@@ -363,9 +363,10 @@ int ath12k_peer_create(struct ath12k *ar, struct ath12k_link_vif *arvif,
+ 	return ret;
+ }
+ 
+-u16 ath12k_peer_ml_alloc(struct ath12k_hw *ah)
++u16 ath12k_peer_ml_alloc(struct ath12k_hw *ah, const u8 *addr)
+ {
+ 	u16 ml_peer_id = ah->last_ml_peer_id;
++	u16 cursor = ah->last_ml_peer_id;
+ 	int i;
+ 
+ 	lockdep_assert_wiphy(ah->hw->wiphy);
+@@ -383,6 +384,9 @@ u16 ath12k_peer_ml_alloc(struct ath12k_hw *ah)
+ 
+ 		set_bit(ml_peer_id, ah->free_ml_peer_id_map);
+ 		ah->last_ml_peer_id = ml_peer_id;
++		ath12k_info(ath12k_ah_to_ar(ah, 0)->ab,
++			    "ml peer id %u allocated (cursor %u) for %pM\n",
++			    ml_peer_id, cursor, addr);
+ 		return ml_peer_id;
+ 	}
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/peer.h b/drivers/net/wireless/ath/ath12k/peer.h
+index 3c4f8bd..7ce6890 100644
+--- a/drivers/net/wireless/ath/ath12k/peer.h
++++ b/drivers/net/wireless/ath/ath12k/peer.h
+@@ -36,7 +36,7 @@ void ath12k_link_sta_rhash_delete(struct ath12k_base *ab, struct ath12k_link_sta
+ int ath12k_link_sta_rhash_add(struct ath12k_base *ab, struct ath12k_link_sta *arsta);
+ struct ath12k_link_sta *ath12k_link_sta_find_by_addr(struct ath12k_base *ab,
+ 						     const u8 *addr);
+-u16 ath12k_peer_ml_alloc(struct ath12k_hw *ah);
++u16 ath12k_peer_ml_alloc(struct ath12k_hw *ah, const u8 *addr);
+ void ath12k_peer_ml_quarantine(struct ath12k_hw *ah,
+ 			       struct ath12k_sta *ahsta, int reason);
+ #endif /* _PEER_H_ */
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+index 632230e..e4d6002 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+@@ -857,6 +857,14 @@ static void ath12k_wifi7_dp_tx_complete_msdu(struct ath12k_pdev_dp *dp_pdev,
+ 		goto exit;
+ 	}
+ 
++	/* Feed the first-TX-burst self-heal check. */
++	if (ts->status == HAL_WBM_TQM_REL_REASON_FRAME_ACKED) {
++		struct ath12k_sta *ahsta = ath12k_sta_to_ahsta(peer->sta);
++
++		if (unlikely(READ_ONCE(ahsta->txburst_check_armed)))
++			atomic_inc(&ahsta->txburst_acked);
++	}
++
+ 	status.sta = peer->sta;
+ 	status.info = info;
+ 	status.skb = msdu;
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hw.c b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+index 97b3987..1659e8f 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hw.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+@@ -996,6 +996,13 @@ static void ath12k_wifi7_mac_op_tx(struct ieee80211_hw *hw,
+ 		ahsta = ath12k_sta_to_ahsta(control->sta);
+ 		if (ahsta && ahsta->enable_4addr)
+ 			arsta = rcu_dereference(ahsta->link[link_id]);
++
++		/* Feed the first-TX-burst self-heal check: count unicast
++		 * data enqueues while the post-authorize probe is armed.
++		 */
++		if (ahsta && !is_mcast &&
++		    unlikely(READ_ONCE(ahsta->txburst_check_armed)))
++			atomic_inc(&ahsta->txburst_attempts);
+ 	}
+ 
+ 	/* This is case only for P2P_GO */
