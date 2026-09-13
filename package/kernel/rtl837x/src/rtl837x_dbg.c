@@ -39,9 +39,25 @@ REGRWFUNC(reg)
 REGRWFUNC(phyreg_mmd)
 REGRWFUNC(sdsreg)
 
+/* The debugfs handlers reach the shared SDS and PHY indirect-access
+ * engines from arbitrary user context; serialize them against the DSA
+ * and worker users through the driver's rtk_lock.  The single active
+ * instance is tracked in rtl_gbl_priv.
+ */
+static int rtl837x_dbg_lock(struct rtk_gsw **gsw)
+{
+	*gsw = rtl_gbl_priv;
+	if (!*gsw)
+		return -ENODEV;
+
+	mutex_lock(&(*gsw)->rtk_lock);
+	return 0;
+}
+
 ssize_t _sdsreg_rw_write(struct file *filep, const char __user *ubuf,
 				   size_t count, loff_t *offp)
 {
+	struct rtk_gsw *gsw;
 	char *buf;
 	uint32_t sds_id, page, reg, val;
 	int ret;
@@ -50,7 +66,7 @@ ssize_t _sdsreg_rw_write(struct file *filep, const char __user *ubuf,
 	buf = memdup_user_nul(ubuf, count);
 	if (IS_ERR(buf))
 		return PTR_ERR(buf);
-	
+
 	if(buf[0] == 'w') {
 		if (sscanf(buf, "w %u %x %x %x", &sds_id, &page, &reg, &val) != 4) {
 			kfree(buf);
@@ -60,7 +76,13 @@ ssize_t _sdsreg_rw_write(struct file *filep, const char __user *ubuf,
 				kfree(buf);
 				return -EFAULT;
 			}
+			ret = rtl837x_dbg_lock(&gsw);
+			if (ret) {
+				kfree(buf);
+				return ret;
+			}
 			ret = rtk_rtl8373_sds_reg_write(sds_id, page, reg, val);
+			mutex_unlock(&gsw->rtk_lock);
 			if (ret) {
 				kfree(buf);
 				return -EIO;
@@ -75,7 +97,13 @@ ssize_t _sdsreg_rw_write(struct file *filep, const char __user *ubuf,
 				kfree(buf);
 				return -EFAULT;
 			}
+			ret = rtl837x_dbg_lock(&gsw);
+			if (ret) {
+				kfree(buf);
+				return ret;
+			}
 			ret = rtk_rtl8373_sds_reg_read(sds_id, page, reg, &val);
+			mutex_unlock(&gsw->rtk_lock);
 			if (ret) {
 				kfree(buf);
 				return -EIO;
@@ -92,6 +120,7 @@ ssize_t _sdsreg_rw_write(struct file *filep, const char __user *ubuf,
 ssize_t _phyreg_mmd_rw_write(struct file *filep, const char __user *ubuf,
 				   size_t count, loff_t *offp)
 {
+	struct rtk_gsw *gsw;
 	char *buf;
 	uint32_t port, devad, reg, val;
 	int ret;
@@ -100,7 +129,7 @@ ssize_t _phyreg_mmd_rw_write(struct file *filep, const char __user *ubuf,
 	buf = memdup_user_nul(ubuf, count);
 	if (IS_ERR(buf))
 		return PTR_ERR(buf);
-	
+
 	if(buf[0] == 'w') {
 		if (sscanf(buf, "w %u %x %x %x", &port, &devad, &reg, &val) != 4) {
 			kfree(buf);
@@ -110,7 +139,13 @@ ssize_t _phyreg_mmd_rw_write(struct file *filep, const char __user *ubuf,
 				kfree(buf);
 				return -EFAULT;
 			}
+			ret = rtl837x_dbg_lock(&gsw);
+			if (ret) {
+				kfree(buf);
+				return ret;
+			}
 			ret = rtk_port_phyReg_set(1 << port, devad, reg, val);
+			mutex_unlock(&gsw->rtk_lock);
 			if (ret) {
 				kfree(buf);
 				return -EIO;
@@ -125,7 +160,13 @@ ssize_t _phyreg_mmd_rw_write(struct file *filep, const char __user *ubuf,
 				kfree(buf);
 				return -EFAULT;
 			}
+			ret = rtl837x_dbg_lock(&gsw);
+			if (ret) {
+				kfree(buf);
+				return ret;
+			}
 			ret = rtk_port_phyReg_get(port, devad, reg, &val);
+			mutex_unlock(&gsw->rtk_lock);
 			if (ret) {
 				kfree(buf);
 				return -EIO;
@@ -188,6 +229,7 @@ ssize_t _reg_rw_write(struct file *filep, const char __user *ubuf,
 static ssize_t _sds_page_dump_read(struct file *filep, char __user *ubuf,
 				size_t count, loff_t *offp)
 {
+	struct rtk_gsw *gsw;
 	char *buf;
 	int len = 0;
 	ssize_t ret;
@@ -196,6 +238,12 @@ static ssize_t _sds_page_dump_read(struct file *filep, char __user *ubuf,
 	buf = kzalloc(4096, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
+
+	ret = rtl837x_dbg_lock(&gsw);
+	if (ret) {
+		kfree(buf);
+		return ret;
+	}
 
 	ret = rtk_rtl8373_getAsicReg(RTL8373_SDS_MODE_SEL_ADDR, &v3);
 	if (ret)
@@ -283,10 +331,12 @@ static ssize_t _sds_page_dump_read(struct file *filep, char __user *ubuf,
 		goto out_error;
 	len += snprintf(buf + len, 4096 - len, "sds page 5  reg 1; bit7:0 = %#x\n", v3);
 
+	mutex_unlock(&gsw->rtk_lock);
 	ret = simple_read_from_buffer(ubuf, count, offp, buf, len);
 	goto out;
 
 out_error:
+	mutex_unlock(&gsw->rtk_lock);
 	ret = -EIO;
 
 out:

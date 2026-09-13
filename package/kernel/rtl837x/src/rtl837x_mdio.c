@@ -692,7 +692,9 @@ static void rtl837x_status_check_work_func(struct work_struct *work)
 		rtnl_lock();
 		dev_close(gsw->ethernet_master);
 		rtnl_unlock();
+		mutex_lock(&gsw->rtk_lock);
 		ret = rtk_sdsMode_set(0, SERDES_OFF);
+		mutex_unlock(&gsw->rtk_lock);
 		if (ret)
 			dev_warn_ratelimited(gsw->dev,
 					     "failed to disable CPU SerDes: %d\n", ret);
@@ -705,7 +707,9 @@ static void rtl837x_status_check_work_func(struct work_struct *work)
 			dev_warn_ratelimited(gsw->dev,
 					     "failed to reopen ethernet master: %d\n", ret);
 
+		mutex_lock(&gsw->rtk_lock);
 		ret = rtk_sdsMode_set(0, gsw->sds0mode);
+		mutex_unlock(&gsw->rtk_lock);
 		if (ret)
 			dev_warn_ratelimited(gsw->dev,
 					     "failed to restore CPU SerDes mode: %d\n", ret);
@@ -773,7 +777,9 @@ static int rtl837x_sfp_module_insert(void *upstream, const struct sfp_eeprom_id 
 		return -EINVAL;
 	}
 
+	mutex_lock(&gsw->rtk_lock);
 	ret = rtk_sdsMode_set(1, gsw->sds1mode);
+	mutex_unlock(&gsw->rtk_lock);
 	if (ret) {
 		gsw->sds1mode = old_mode;
 		dev_err(gsw->dev, "failed to set SFP SerDes mode: %d\n", ret);
@@ -791,7 +797,9 @@ static void rtl837x_sfp_module_remove(void *upstream)
 	dev_info(gsw->dev, "SFP module remove\n");
 
 	USE_SERDESMODE(1, SERDES_OFF);
+	mutex_lock(&gsw->rtk_lock);
 	ret = rtk_sdsMode_set(1, gsw->sds1mode);
+	mutex_unlock(&gsw->rtk_lock);
 	if (ret) {
 		gsw->sds1mode = old_mode;
 		dev_err(gsw->dev, "failed to disable SFP SerDes: %d\n", ret);
@@ -965,6 +973,7 @@ static int rtl837x_dsa_probe(struct mdio_device *mdiodev)
 
 	mutex_init(&gsw->map_lock);
 	mutex_init(&gsw->flood_lock);
+	mutex_init(&gsw->rtk_lock);
 	
 	rc = rtl837x_mdio_regmap_config;
 	rc.lock_arg = gsw;

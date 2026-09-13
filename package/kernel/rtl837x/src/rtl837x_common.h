@@ -99,6 +99,15 @@ struct rtk_gsw {
 	struct regmap		*map_nolock;
 	struct mutex		map_lock;
 	struct mutex		flood_lock;
+	/* Serializes multi-register indirect-access engines (ITA table
+	 * access, MIB counter access, PHY SMI access, SerDes indirect
+	 * access) across contexts that rtnl does not cover: the DSA FDB
+	 * worker, the stats and CPU-port status workers, the SFP state
+	 * machine, phylib C45 accesses and debugfs.  regmap's map_lock only
+	 * makes individual register operations atomic, not these sequences.
+	 * Never hold rtk_lock while acquiring rtnl.
+	 */
+	struct mutex		rtk_lock;
 
 	struct gpio_desc *reset_pin;
 	int mdio_addr;
