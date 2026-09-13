@@ -1,6 +1,6 @@
 From: cvediver <cvediver@gmail.com>
 Subject: [PATCH] net: ethernet: qualcomm: ppe: recover Tx queues stopped across
- a link flap
+ a carrier loss then link-up
 
 A Tx queue stopped on ring exhaustion is woken only from
 edma_tx_complete(), and that wake is gated on netif_carrier_ok().  A
@@ -28,7 +28,7 @@ Signed-off-by: cvediver <cvediver@gmail.com>
 +	/* Tx queues stopped on ring exhaustion are woken only by the Tx
 +	 * completion path, which cannot run for a stopped queue whose ring
 +	 * has already drained.  Start every queue on open so that an
-+	 * ifdown/ifup cycle recovers queues left stopped by a link flap;
++	 * ifdown/ifup cycle recovers queues left stopped by carrier loss;
 +	 * starting only queue 0 left the others stopped forever.
 +	 */
 +	netif_tx_start_all_queues(netdev);
