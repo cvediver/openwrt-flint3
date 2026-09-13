@@ -1,0 +1,63 @@
+From: Tyler Flynn <tyler@cybersealabs.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: recover Tx queues stopped across
+ a carrier loss then link-up
+
+A Tx queue stopped on ring exhaustion is woken only from
+edma_tx_complete(), and that wake is gated on netif_carrier_ok().  A
+completion reaped after the carrier dropped therefore skips the wake;
+once the ring has drained there are no further completions, so nothing
+wakes the queue when the carrier returns.  The driver has no
+ndo_tx_timeout, so dev_watchdog is never armed and cannot recover the
+queue, and edma_port_open() starts only queue 0 (netif_start_queue), so
+even an ifdown/ifup cycle leaves queues 1..n stopped forever.
+
+Drop the carrier gate from the completion-side wake -- waking a queue
+while the carrier is down is harmless since the qdisc is deactivated --
+and start all Tx queues in edma_port_open() so that reopening the
+device recovers any queue left stopped.
+
+Signed-off-by: Tyler Flynn <tyler@cybersealabs.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
+@@ -115,7 +115,13 @@
+ 	edma_cfg_tx_napi_enable(port_id);
+ 	edma_cfg_tx_enable_interrupts(port_id);
+ 
+-	netif_start_queue(netdev);
++	/* Tx queues stopped on ring exhaustion are woken only by the Tx
++	 * completion path, which cannot run for a stopped queue whose ring
++	 * has already drained.  Start every queue on open so that an
++	 * ifdown/ifup cycle recovers queues left stopped by carrier loss;
++	 * starting only queue 0 left the others stopped forever.
++	 */
++	netif_tx_start_all_queues(netdev);
+ 
+ 	return 0;
+ }
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
+@@ -218,7 +218,12 @@
+ 
+ 	/* If tx_requeue_stop disabled (tx_requeue_stop = 0)
+ 	 * Fetch the tx queue paired with this Tx cmpl ring and check if it
+-	 * is stopped. if queue is stopped and interface is up, wake it up.
++	 * is stopped. if queue is stopped, wake it up.  The wake must not
++	 * be gated on netif_carrier_ok(): a completion reaped while the
++	 * carrier is down is the last wake this queue will ever get -- the
++	 * ring is empty afterwards and nothing wakes the queue on
++	 * carrier-up, wedging it permanently.  Waking with the carrier down
++	 * is harmless; the qdisc is deactivated and nothing is transmitted.
+ 	 *
+ 	 * The queue must be derived from the ring, not from the CPU running
+ 	 * this completion handler: Tx desc and Tx cmpl rings are paired
+@@ -237,8 +242,7 @@
+ 		queue_id = (txcmpl_ring->id - edma_ctx->hw_info->txcmpl->ring_start) %
+ 			   num_possible_cpus();
+ 		nq = netdev_get_tx_queue(txcmpl_ring->napi.dev, queue_id);
+-		if (unlikely(netif_tx_queue_stopped(nq)) &&
+-		    netif_carrier_ok(txcmpl_ring->napi.dev)) {
++		if (unlikely(netif_tx_queue_stopped(nq))) {
+ 			dev_dbg(dev, "Waking queue number %d, for interface %s\n",
+ 				queue_id, txcmpl_ring->napi.dev->name);
+ 			__netif_tx_lock(nq, smp_processor_id());
