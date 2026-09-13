@@ -22,7 +22,9 @@ the ATH12K_MAX_MLO_PEERS-bit maps, corrupting the adjacent
 ath12k_hw::dp_hw state (dp_peers[] RCU pointers) while leaking the
 intended bit. Mask the id back to the host domain and bounds-check it
 with a WARN_ON_ONCE before touching either bitmap, mirroring the SSR
-fix.
+fix. While here, make the release diagnostic truthful: it now prints
+the masked host-domain id and whether the id was actually returned to
+the pool or retained in quarantine.
 
 Second, nothing clamps the usable ML peer ID count to the hardware
 limit. ah->max_ml_peer_ids is seeded with the 1024-bit host bitmap
@@ -38,48 +40,64 @@ time; the setup complete event value can then only shrink it further.
 
 Signed-off-by: cvediver <cvediver@gmail.com>
 ---
- drivers/net/wireless/ath/ath12k/mac.c | 23 +++++++++++++++++++----
- 1 file changed, 19 insertions(+), 4 deletions(-)
+ drivers/net/wireless/ath/ath12k/mac.c | 41 +++++++++++++++++++++++++--------
+ 1 file changed, 31 insertions(+), 10 deletions(-)
 
 diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
 index f791c2a..0865c61 100644
 --- a/drivers/net/wireless/ath/ath12k/mac.c
 +++ b/drivers/net/wireless/ath/ath12k/mac.c
-@@ -7401,11 +7401,14 @@ static void ath12k_mac_ml_station_remove(struct ath12k_vif *ahvif,
+@@ -7401,11 +7401,19 @@ static void ath12k_mac_ml_station_remove(struct ath12k_vif *ahvif,
  		ath12k_peer_ml_quarantine(ah, ahsta, ret);
  
  	if (sta->mlo) {
 +		u16 ml_peer_id = ahsta->ml_peer_id & ~ATH12K_PEER_ML_ID_VALID;
 +
- 		ath12k_info(ath12k_ah_to_ar(ah, 0)->ab,
- 			    "ml peer id %u freed for %pM\n",
- 			    ahsta->ml_peer_id, sta->addr);
+-		ath12k_info(ath12k_ah_to_ar(ah, 0)->ab,
+-			    "ml peer id %u freed for %pM\n",
+-			    ahsta->ml_peer_id, sta->addr);
 -		if (!test_bit(ahsta->ml_peer_id, ah->quarantined_ml_peer_id_map))
 -			clear_bit(ahsta->ml_peer_id, ah->free_ml_peer_id_map);
-+		if (!WARN_ON_ONCE(ml_peer_id >= ATH12K_MAX_MLO_PEERS) &&
-+		    !test_bit(ml_peer_id, ah->quarantined_ml_peer_id_map))
-+			clear_bit(ml_peer_id, ah->free_ml_peer_id_map);
++		if (!WARN_ON_ONCE(ml_peer_id >= ATH12K_MAX_MLO_PEERS)) {
++			bool quarantined =
++				test_bit(ml_peer_id,
++					 ah->quarantined_ml_peer_id_map);
++
++			ath12k_info(ath12k_ah_to_ar(ah, 0)->ab,
++				    "ml peer id %u released for %pM (quarantined=%d)\n",
++				    ml_peer_id, sta->addr, quarantined);
++			if (!quarantined)
++				clear_bit(ml_peer_id, ah->free_ml_peer_id_map);
++		}
  		ahsta->ml_peer_id = ATH12K_MLO_PEER_ID_INVALID;
  	}
  }
-@@ -8127,11 +8130,14 @@ peer_delete:
+@@ -8127,11 +8127,19 @@ peer_delete:
  	ath12k_dp_peer_delete(&ah->dp_hw, sta->addr, sta);
  ml_peer_id_clear:
  	if (sta->mlo) {
 +		u16 ml_peer_id = ahsta->ml_peer_id & ~ATH12K_PEER_ML_ID_VALID;
 +
- 		ath12k_info(ath12k_ah_to_ar(ah, 0)->ab,
- 			    "ml peer id %u freed for %pM\n",
- 			    ahsta->ml_peer_id, sta->addr);
+-		ath12k_info(ath12k_ah_to_ar(ah, 0)->ab,
+-			    "ml peer id %u freed for %pM\n",
+-			    ahsta->ml_peer_id, sta->addr);
 -		if (!test_bit(ahsta->ml_peer_id, ah->quarantined_ml_peer_id_map))
 -			clear_bit(ahsta->ml_peer_id, ah->free_ml_peer_id_map);
-+		if (!WARN_ON_ONCE(ml_peer_id >= ATH12K_MAX_MLO_PEERS) &&
-+		    !test_bit(ml_peer_id, ah->quarantined_ml_peer_id_map))
-+			clear_bit(ml_peer_id, ah->free_ml_peer_id_map);
++		if (!WARN_ON_ONCE(ml_peer_id >= ATH12K_MAX_MLO_PEERS)) {
++			bool quarantined =
++				test_bit(ml_peer_id,
++					 ah->quarantined_ml_peer_id_map);
++
++			ath12k_info(ath12k_ah_to_ar(ah, 0)->ab,
++				    "ml peer id %u released for %pM (quarantined=%d)\n",
++				    ml_peer_id, sta->addr, quarantined);
++			if (!quarantined)
++				clear_bit(ml_peer_id, ah->free_ml_peer_id_map);
++		}
  		ahsta->ml_peer_id = ATH12K_MLO_PEER_ID_INVALID;
  	}
  exit:
-@@ -15710,6 +15716,15 @@ static struct ath12k_hw *ath12k_mac_hw_allocate(struct ath12k_hw_group *ag,
+@@ -15710,6 +15710,15 @@ static struct ath12k_hw *ath12k_mac_hw_allocate(struct ath12k_hw_group *ag,
  	ah->num_radio = num_pdev_map;
  	ah->max_ml_peer_ids = ATH12K_MAX_MLO_PEERS;
  
