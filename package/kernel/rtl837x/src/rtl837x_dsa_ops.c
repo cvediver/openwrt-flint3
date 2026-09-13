@@ -1797,6 +1797,16 @@ static int rtl837x_port_vlan_add(struct dsa_switch *ds, int port,
 		return -EINVAL;
 	}
 
+	/* Be sure to deny alterations to the configuration done by tag_8021q.
+	 * These VLANs share gsw->vlan_table[] and the hardware VLAN table with
+	 * the standalone/bridge VIDs programmed via rtl837x_tag_8021q_vlan_add().
+	 */
+	if (vid_is_dsa_8021q(vid)) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Range 3072-4095 reserved for dsa_8021q operation");
+		return -EBUSY;
+	}
+
 	old_vlan = gsw->vlan_table[vid];
 
 	gsw->vlan_table[vid].valid = 1;
