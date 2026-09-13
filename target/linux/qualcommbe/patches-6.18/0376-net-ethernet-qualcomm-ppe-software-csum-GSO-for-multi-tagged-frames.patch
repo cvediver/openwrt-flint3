@@ -1,0 +1,81 @@
+From: cvediver <cvediver@gmail.com>
+Date: Sun, 7 Sep 2026 00:00:00 +0000
+Subject: [PATCH] net: ethernet: qualcomm: ppe: software csum/GSO for
+ multi-tagged frames
+
+The EDMA TX path enables the PPE inline checksum/TSO engine for
+CHECKSUM_PARTIAL skbs by setting the ip_csum/l4_csum bits in TX
+descriptor word5 (edma_tx_fill_pp_desc()), but never programs L3/L4
+offsets and ignores the skb's csum_start/csum_offset: the hardware
+locates the headers with its own parser. That violates the
+NETIF_F_HW_CSUM contract the driver advertises, and turns any frame
+layout the parser cannot walk into silent L4 checksum corruption on
+the wire.
+
+A single 802.1Q tag is parsed correctly - that is why the rtl837x
+switch tagging was moved to tag_8021q (DSA_TAG_PROTO_VSC73XX_8021Q)
+and the previous blanket software-csum fallback for DSA conduits was
+dropped. But the driver configures no outer-TPID/QinQ parsing (the
+vendor SSDK exposes stag_tpid/qinq_mode registers for this; nothing
+in this driver touches them), so a frame carrying two VLAN headers
+is at best unverified and at worst checksummed at offsets 4 bytes
+short. Double-tagged frames are a normal product of the tag_8021q
+conduit path: a user VLAN sub-interface on a switch port, or
+host-originated traffic through a VLAN-aware bridge, ends up as
+tag_8021q outer tag + user/bridge inner tag on the conduit.
+
+Restore a fallback in ndo_features_check, but a targeted one: strip
+the checksum and GSO features only when the skb carries more than
+one VLAN header (skb_vlan_tagged_multi()). Untagged and
+single-tagged frames - including all plain tag_8021q conduit traffic
+- keep full hardware checksum/TSO offload.
+
+Note that defining ndo_features_check also bypasses the core's
+dflt_features_check()/vlan_features_check() for this driver, and
+even that default would not have helped: it deliberately keeps
+NETIF_F_HW_CSUM for multi-tagged skbs on the assumption the hardware
+honours csum_start/csum_offset, which this hardware does not.
+
+Signed-off-by: cvediver <cvediver@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/edma_port.c | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
+@@ -11,6 +11,8 @@
+ #include <linux/phylink.h>
+ #include <linux/printk.h>
+ 
++#include <linux/if_vlan.h>
++
+ #include "edma.h"
+ #include "edma_cfg_rx.h"
+ #include "edma_cfg_tx.h"
+@@ -177,10 +179,25 @@
+ 	return ret;
+ }
+ 
+-static netdev_features_t edma_port_feature_check(__maybe_unused struct sk_buff *skb,
++static netdev_features_t edma_port_feature_check(struct sk_buff *skb,
+ 						 __maybe_unused struct net_device *netdev,
+ 						 netdev_features_t features)
+ {
++	/* The PPE TX checksum/TSO engine locates the L3/L4 headers with an
++	 * inline packet parser: no offsets are programmed into the TX
++	 * descriptor and csum_start/csum_offset are ignored.  The parser
++	 * handles standard Ethernet with at most one 802.1Q tag (the
++	 * tag_8021q DSA conduit case), but no outer-TPID/QinQ parsing is
++	 * configured anywhere in this driver, so a frame carrying more
++	 * than one VLAN header - a user VLAN or bridge VLAN stacked on
++	 * the tag_8021q conduit tag, or plain QinQ - would have its L4
++	 * checksum computed at the wrong offsets and silently corrupted
++	 * on the wire.  Fall back to software checksumming and GSO for
++	 * such frames.
++	 */
++	if (skb_vlan_tagged_multi(skb))
++		features &= ~(NETIF_F_CSUM_MASK | NETIF_F_GSO_MASK);
++
+ 	return features;
+ }
+ 

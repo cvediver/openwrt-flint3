@@ -1,4 +1,4 @@
-From: Tyler Flynn <tyler@cybersealabs.com>
+From: cvediver <cvediver@gmail.com>
 Subject: [PATCH] net: ethernet: qualcomm: ppe: recover Tx queues stopped across
  a carrier loss then link-up
 
@@ -16,7 +16,7 @@ while the carrier is down is harmless since the qdisc is deactivated --
 and start all Tx queues in edma_port_open() so that reopening the
 device recovers any queue left stopped.
 
-Signed-off-by: Tyler Flynn <tyler@cybersealabs.com>
+Signed-off-by: cvediver <cvediver@gmail.com>
 ---
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
