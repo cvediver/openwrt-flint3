@@ -1,0 +1,103 @@
+From: cvediver <cvediver@gmail.com>
+Subject: [PATCH] wifi: ath12k: gate BAR access while the PCIe link is dead
+
+The recovery-path link reset (previous patch) is not sufficient on
+IPQ5332: between the RDDM crash notification and the reset, other
+contexts - the core halt worker, remoteproc coredump, the MHI state
+machine - keep issuing BAR reads to the crashed endpoint, and each
+such read can raise a fatal Asynchronous SError on the NoC (fourth
+ramoops-captured panic: _copy_to_iter and ath12k_pci_read32 under
+ath12k_core_halt, 8 s after MHI_CB_EE_RDDM).
+
+Mirror the vendor cnss driver: mark the link dead the moment RDDM is
+signalled, make every BAR accessor (ath12k_pci_read32/write32 and the
+MHI register ops) return ~0 / discard while the flag is set, and
+clear the flag only after the recovery power-up has reset and
+retrained the link.
+
+--- a/drivers/net/wireless/ath/ath12k/pci.h
++++ b/drivers/net/wireless/ath/ath12k/pci.h
+@@ -93,6 +93,7 @@ enum ath12k_pci_flags {
+ 	ATH12K_PCI_FLAG_IS_MSI_64,
+ 	ATH12K_PCI_ASPM_RESTORE,
+ 	ATH12K_PCI_FLAG_MULTI_MSI_VECTORS,
++	ATH12K_PCI_FLAG_LINK_DEAD,
+ };
+ 
+ struct ath12k_pci_ops {
+--- a/drivers/net/wireless/ath/ath12k/pci.c
++++ b/drivers/net/wireless/ath/ath12k/pci.c
+@@ -1165,6 +1165,13 @@ u32 ath12k_pci_read32(struct ath12k_base
+ 	u32 val, window_start;
+ 	int ret = 0;
+ 
++	/* A BAR read to a crashed endpoint whose link is retraining
++	 * raises a fatal SError on the IPQ5332 NoC instead of
++	 * returning ~0; short-circuit while the link is down.
++	 */
++	if (test_bit(ATH12K_PCI_FLAG_LINK_DEAD, &ab_pci->flags))
++		return 0xffffffff;
++
+ 	/* for offset beyond BAR + 4K - 32, may
+ 	 * need to wakeup MHI to access.
+ 	 */
+@@ -1213,6 +1213,9 @@ void ath12k_pci_write32(struct ath12k_ba
+ 	u32 window_start;
+ 	int ret = 0;
+ 
++	if (test_bit(ATH12K_PCI_FLAG_LINK_DEAD, &ab_pci->flags))
++		return;
++
+ 	/* for offset beyond BAR + 4K - 32, may
+ 	 * need to wakeup MHI to access.
+ 	 */
+@@ -1460,5 +1460,6 @@ int ath12k_pci_power_up(struct ath12k_ba
+ 		}
+ 
+ 		pci_set_master(ab_pci->pdev);
++		clear_bit(ATH12K_PCI_FLAG_LINK_DEAD, &ab_pci->flags);
+ 	}
+ 	ab_pci->powered_up_once = true;
+--- a/drivers/net/wireless/ath/ath12k/mhi.c
++++ b/drivers/net/wireless/ath/ath12k/mhi.c
+@@ -151,6 +151,13 @@ static void ath12k_mhi_op_status_cb(stru
+ 	case MHI_CB_EE_RDDM:
+ 		ath12k_warn(ab, "firmware crashed: MHI_CB_EE_RDDM\n");
+ 
++		/* Stop all BAR traffic before anything else runs: on
++		 * IPQ5332 a read to the resetting endpoint is a fatal
++		 * SError, and the halt/recovery workers issue reads
++		 * before the link reset in power-up happens.
++		 */
++		set_bit(ATH12K_PCI_FLAG_LINK_DEAD, &ab_pci->flags);
++
+ 		if (ab_pci->mhi_pre_cb == MHI_CB_EE_RDDM) {
+ 			ath12k_dbg(ab, ATH12K_DBG_BOOT,
+ 				   "do not queue again for consecutive RDDM event\n");
+@@ -176,6 +176,14 @@ static int ath12k_mhi_op_read_reg(struct
+ 				  void __iomem *addr,
+ 				  u32 *out)
+ {
++	struct ath12k_base *ab = dev_get_drvdata(mhi_cntrl->cntrl_dev);
++	struct ath12k_pci *ab_pci = ath12k_pci_priv(ab);
++
++	if (test_bit(ATH12K_PCI_FLAG_LINK_DEAD, &ab_pci->flags)) {
++		*out = 0xffffffff;
++		return 0;
++	}
++
+ 	*out = readl(addr);
+ 
+ 	return 0;
+@@ -185,5 +185,11 @@ static void ath12k_mhi_op_write_reg(stru
+ 				    void __iomem *addr,
+ 				    u32 val)
+ {
++	struct ath12k_base *ab = dev_get_drvdata(mhi_cntrl->cntrl_dev);
++	struct ath12k_pci *ab_pci = ath12k_pci_priv(ab);
++
++	if (test_bit(ATH12K_PCI_FLAG_LINK_DEAD, &ab_pci->flags))
++		return;
++
+ 	writel(val, addr);
+ }
