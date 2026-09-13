@@ -86,6 +86,14 @@ define Device/glinet_gl-be9300
 	DEVICE_DTS_CONFIG := config-1
 	SOC := ipq5332
 	SUPPORTED_DEVICES += gl.inet,gl-be9300
+	# The kernel FIT is written raw into the 7,340,032-byte 0:HLOS GPT
+	# partition (stock layout, p12) by both the sysupgrade tar path and
+	# the factory bootscript, neither of which checked its size before
+	# this limit existed. image.mk runs check-size on the flashable
+	# kernel whenever KERNEL_SIZE is set (the TFTP initramfs image is
+	# exempt), so an oversized kernel now fails at build time instead
+	# of soft-bricking at flash time.
+	KERNEL_SIZE := 7168k
 	IMAGE/factory.bin := append-rootfs | pad-rootfs | pad-to 64k | \
 		gl-be9300-factory | append-gl-metadata
 	DEVICE_PACKAGES := kmod-ath12k ath12k-firmware-ipq5332 \
