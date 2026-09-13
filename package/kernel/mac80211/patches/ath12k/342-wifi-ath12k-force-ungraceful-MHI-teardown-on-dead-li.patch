@@ -1,0 +1,29 @@
+From: cvediver <cvediver@gmail.com>
+Subject: [PATCH] wifi: ath12k: force ungraceful MHI teardown on a dead link
+
+With BAR access gated while the link is dead, the graceful MHI power
+off starves waiting for device acknowledgements that read back as ~0,
+and the recovery wedges after "stopped remote processor q6wcss": WMI
+keeps timing out (-108) and the group restart never runs (observed on
+the GL-BE9300 bench). The crashed endpoint cannot participate in a
+graceful handshake anyway; use the driver's existing FORCE_POWER_OFF
+state (mhi_power_down with graceful=false) when the link-dead flag is
+set, so teardown completes immediately and power-up's link reset takes
+it from there.
+
+--- a/drivers/net/wireless/ath/ath12k/mhi.c
++++ b/drivers/net/wireless/ath/ath12k/mhi.c
+@@ -529,11 +529,13 @@ void ath12k_mhi_stop(struct ath12k_pci *
+ 	/* During suspend we need to use mhi_power_down_keep_dev()
+ 	 * workaround, otherwise ath12k_core_resume() will timeout
+ 	 * during resume.
+ 	 */
+ 	if (is_suspend)
+ 		ath12k_mhi_set_state(ab_pci, ATH12K_MHI_POWER_OFF_KEEP_DEV);
++	else if (test_bit(ATH12K_PCI_FLAG_LINK_DEAD, &ab_pci->flags))
++		ath12k_mhi_set_state(ab_pci, ATH12K_MHI_FORCE_POWER_OFF);
+ 	else
+ 		ath12k_mhi_set_state(ab_pci, ATH12K_MHI_POWER_OFF);
+ 
+ 	ath12k_mhi_set_state(ab_pci, ATH12K_MHI_DEINIT);
+ }
